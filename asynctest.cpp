@@ -7,23 +7,32 @@
 #include <queue>
 #include <mutex>
 #include <functional>
+#include <future>
 #define WIN32_LEAN_AND_MEAN
 #define WIN32_NOMINMAX
 #include <Windows.h>
 #include <string>
 #include "resource.h"
 
-struct task
+struct promise_t;
+
+using coroutine_t = std::coroutine_handle<promise_t>;
+
+template<>
+struct std::coroutine_traits<coroutine_t> {
+    using promise_type = promise_t;
+};
+
+struct promise_t
 {
-    struct promise_type
-    {
-        task get_return_object() { return {}; }
-        
-        std::suspend_never initial_suspend() noexcept { return {}; }
-        std::suspend_never final_suspend() noexcept { return {}; }
-        void return_void() {}
-        void unhandled_exception() {}
-    };
+    PAINTSTRUCT* ps{};
+
+    coroutine_t get_return_object() { return { coroutine_t::from_promise(*this) }; }
+    
+    std::suspend_never initial_suspend() noexcept { return {}; }
+    std::suspend_never final_suspend() noexcept { return {}; }
+    void return_void() {}
+    void unhandled_exception() {}
 };
 
 struct background_worker
@@ -31,7 +40,7 @@ struct background_worker
     bool canceled{ false };
     std::condition_variable cv;
     std::mutex mtx;
-    std::queue<std::coroutine_handle<>> q;
+    std::queue<coroutine_t> q;
     std::jthread thread;
 
     void run()
@@ -78,7 +87,7 @@ auto switch_background()
 
         bool await_ready() { return false; }
 
-        void await_suspend(std::coroutine_handle<> h)
+        void await_suspend(coroutine_t h)
         {
             std::unique_lock lock{ worker.mtx };
             worker.q.push(std::move(h));
@@ -97,11 +106,11 @@ auto switch_threadpool()
 
         static void callback(PTP_CALLBACK_INSTANCE instance, void* ctx, PTP_WORK work)
         {
-            auto h{ std::coroutine_handle<>::from_address(ctx) };
+            auto h{ coroutine_t::from_address(ctx) };
             h.resume();
         }
 
-        void await_suspend(std::coroutine_handle<> h)
+        void await_suspend(coroutine_t h)
         {
             auto work{ CreateThreadpoolWork(&awaitable::callback, h.address(), nullptr) };
             SubmitThreadpoolWork(work);
@@ -112,14 +121,16 @@ auto switch_threadpool()
     return awaitable();
 }
 
-task query();
-task counter();
+coroutine_t query();
+coroutine_t counter();
+coroutine_t blink();
 
 HWND dlg_hwnd;
 
 std::mutex foreground_mtx;
-std::queue<std::coroutine_handle<>> foreground_ready;
-std::queue<std::coroutine_handle<>> timer_ready;
+std::queue<coroutine_t> foreground_ready;
+std::queue<coroutine_t> timer_ready;
+std::queue<coroutine_t> paint_ready;
 INT_PTR dialog_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
     switch (msg)
@@ -128,6 +139,8 @@ INT_PTR dialog_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
             dlg_hwnd = hwnd;
             SetTimer(dlg_hwnd, 0, 1000, nullptr);
             worker.emplace();
+
+            blink();
             break;
         case WM_COMMAND:
             switch (LOWORD(wparam)) {
@@ -156,6 +169,23 @@ INT_PTR dialog_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
                 lock.lock();
             }
             return 1;
+        }
+        case WM_PAINT:
+        {
+            PAINTSTRUCT ps;
+            BeginPaint(dlg_hwnd, &ps);
+            std::unique_lock lock{ foreground_mtx };
+            while (paint_ready.size())
+            {
+                auto coro{ std::move(paint_ready.front()) };
+                paint_ready.pop();
+
+                lock.unlock();
+                coro.promise().ps = &ps;
+                coro.resume();
+                lock.lock();
+            }
+            EndPaint(dlg_hwnd, &ps);
         }
         case WM_USER:
         {
@@ -186,7 +216,7 @@ auto switch_timer()
         HWND hwnd;
         bool await_ready() { return false; }
         
-        void await_suspend(std::coroutine_handle<> h)
+        void await_suspend(coroutine_t h)
         {
             std::unique_lock lock{ foreground_mtx };
             timer_ready.push(std::move(h));
@@ -198,13 +228,33 @@ auto switch_timer()
     return awaitable{dlg_hwnd};
 }
 
+auto switch_paint()
+{
+    struct awaitable {
+        HWND hwnd;
+        PAINTSTRUCT **ps;
+        bool await_ready() { return false; }
+        
+        void await_suspend(coroutine_t h)
+        {
+            std::unique_lock lock{ foreground_mtx };
+            ps = &h.promise().ps;
+            paint_ready.push(std::move(h));
+        }
+
+        PAINTSTRUCT* await_resume() { return *ps; };
+    };
+
+    return awaitable{dlg_hwnd};
+}
+
 auto switch_foreground()
 {
     struct awaitable {
         HWND hwnd;
         bool await_ready() { return false; }
         
-        void await_suspend(std::coroutine_handle<> h)
+        void await_suspend(coroutine_t h)
         {
             std::unique_lock lock{ foreground_mtx };
             foreground_ready.push(std::move(h));
@@ -217,7 +267,7 @@ auto switch_foreground()
     return awaitable{dlg_hwnd};
 }
 
-task query()
+coroutine_t query()
 {
     auto btn{ GetDlgItem(dlg_hwnd, IDC_BUTTON1) };
     auto lbl{ GetDlgItem(dlg_hwnd, IDC_STATIC1) };
@@ -233,23 +283,38 @@ task query()
     EnableWindow(btn, true);
 }
 
-task counter()
+coroutine_t counter()
 {
     auto btn{ GetDlgItem(dlg_hwnd, IDC_BUTTON2) };
     auto lbl{ GetDlgItem(dlg_hwnd, IDC_STATIC2) };
 
-    query();
     SetWindowText(lbl, L"");
     EnableWindow(btn, 0);
     for (int i = 0; i < 10; ++i)
     {
-        co_await switch_threadpool();
-//        SleepEx(200, true);
+        co_await switch_background();
+        SleepEx(200, true);
 
         co_await switch_foreground();
         SetWindowText(lbl, std::to_wstring(i).c_str());
     }
     EnableWindow(btn, true);
+}
+
+coroutine_t blink()
+{
+    std::array<COLORREF, 3> colors{ { RGB(255, 0, 0), RGB(0, 255, 0), RGB(0, 0, 255) } };
+    for (int i{}; ; i = (i + 1) % colors.size())
+    {
+        RECT rect{ .left = 250, .top = 10, .right = 300, .bottom = 60 };
+        co_await switch_timer();
+        InvalidateRect(dlg_hwnd, &rect, 0);
+
+        auto ps{ co_await switch_paint() };
+        SetDCBrushColor(ps->hdc, colors[i]);
+        SelectObject(ps->hdc, ::GetStockObject(DC_BRUSH));
+        Rectangle(ps->hdc, rect.left, rect.top, rect.right, rect.bottom);
+    }
 }
 
 int main()
