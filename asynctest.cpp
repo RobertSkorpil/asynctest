@@ -186,6 +186,7 @@ INT_PTR dialog_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
                 lock.lock();
             }
             EndPaint(dlg_hwnd, &ps);
+            return 1;
         }
         case WM_USER:
         {
